@@ -9,39 +9,28 @@ from llm_rl.models.logprobs import (
     approx_kl_from_logprobs,
     compute_per_token_logprobs,
     masked_mean,
-    masked_mean_per_row,
 )
 from llm_rl.rl.base import GradClipFn, RLAlgorithm, _default_grad_clip
 from llm_rl.rollout.rollout_buffer import RolloutBatch, iter_minibatches
 
 
 class CISPO(RLAlgorithm):
-    """CISPO: Clipped Importance Sampling Policy Optimization.
+    """CISPO: Clipped IS-weight Policy Optimization (arXiv 2503.12018).
 
-    Extends GRPO with dual clipping and an explicit entropy bonus.
+    Instead of PPO's pessimistic min over clipped/unclipped surrogate,
+    CISPO clips the importance-sampling weight directly and uses it to
+    reweight the standard policy gradient objective:
 
-    Standard PPO-style clipping prevents the ratio from moving *too far*
-    from 1 in either direction, but when the advantage is very negative
-    the clipped objective can still produce an arbitrarily large negative
-    contribution.  Dual clipping adds a *floor* of  ``c * A_i``  for
-    negative-advantage sequences, where ``c > 1`` (``dual_clip_coef``).
-    This bounds the influence of worst-case completions and stabilises
-    training on noisy reward signals.
+        J = (1 / sum|o_i|) sum_i sum_t  sg(r̂_{i,t}) * A_i * log pi_θ(o_{i,t} | q, o_{i,<t})
 
-    An explicit entropy bonus (controlled by ``entropy_coef``) is added
-    to the loss to encourage continued exploration, complementing the
-    clipping-based trust region.
+    where  r̂_{i,t} = clip(r_{i,t}, 1 - eps_low, 1 + eps_high)
 
-    Formally, for each token position t in sequence i:
+    The paper sets eps_low to a large value (effectively no lower bound)
+    and eps_high = clip_eps_high.  Gradients flow only through log pi_θ
+    because the clipped ratio is stop-gradiented.
 
-        ppo_obj_{i,t}  = min(r_t * A_i,  clip(r_t, 1-eps, 1+eps) * A_i)
-
-        obj_{i,t}  = ppo_obj_{i,t}                      if A_i >= 0
-                     max(ppo_obj_{i,t},  c * A_i)        if A_i < 0
-
-    where  r_t = pi_theta(a_t | s_<t) / pi_old(a_t | s_<t).
-
-    Loss = -mean_i[ mean_t obj_{i,t} ]  +  kl_coef * KL  -  entropy_coef * H
+    An explicit entropy bonus (entropy_coef) is added per the paper's
+    ablations.
     """
 
     name = "cispo"
@@ -59,13 +48,13 @@ class CISPO(RLAlgorithm):
         model.train()
         model.config.use_cache = False
 
-        dual_c = cfg.dual_clip_coef
         ent_coef = cfg.entropy_coef
+        eps_high = cfg.clip_eps_high
+        eps_low = cfg.clip_eps
 
         total_loss = 0.0
         total_kl = 0.0
         total_clipfrac = 0.0
-        total_dual_clipfrac = 0.0
         total_entropy = 0.0
         n_mb = 0
         accum = 0
@@ -97,31 +86,22 @@ class CISPO(RLAlgorithm):
                 log_ratio = torch.clamp(new_logp - mb.old_logprobs, min=-20.0, max=20.0)
                 ratio = torch.exp(log_ratio)
 
+                # Clip the IS weight directly (Eq. 5). sg() = .detach().
+                clipped_ratio = torch.clamp(ratio, 1.0 - eps_low, 1.0 + eps_high).detach()
+
                 adv_t = adv.unsqueeze(1)                                      # [B, 1]
 
-                unclipped = ratio * adv_t
-                clipped = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * adv_t
-                ppo_obj = torch.minimum(unclipped, clipped)
-
-                # Dual clip: impose floor c * A_i when A_i < 0.
-                neg_mask = (adv_t < 0).float()                                # [B, 1]
-                dual_floor = dual_c * adv_t                                   # [B, 1]
-                per_token_obj = (
-                    ppo_obj * (1.0 - neg_mask)
-                    + torch.maximum(ppo_obj, dual_floor) * neg_mask
-                )
-
-                seq_obj = masked_mean_per_row(per_token_obj * mask, mask)      # [B]
-                pg_loss = -torch.mean(seq_obj)
+                # Eq. 4: sg(r̂) * A * log pi_θ  — token-level, averaged across
+                # all completion tokens in the minibatch (not per-sequence first).
+                per_token_obj = clipped_ratio * adv_t * new_logp              # [B, T]
+                total_tokens = mask.sum()
+                pg_loss = -(per_token_obj * mask).sum() / (total_tokens + 1e-8)
 
                 kl = approx_kl_from_logprobs(new_logp, mb.ref_logprobs, mask)
                 entropy = -masked_mean(new_logp, mask)
 
-                is_clipped = ((ratio < 1.0 - cfg.clip_eps) | (ratio > 1.0 + cfg.clip_eps)).float()
+                is_clipped = ((ratio < 1.0 - eps_low) | (ratio > 1.0 + eps_high)).float()
                 clipfrac = masked_mean(is_clipped, mask)
-
-                is_dual = neg_mask * (ppo_obj < dual_floor).float()
-                dual_clipfrac = masked_mean(is_dual, mask)
 
                 loss = (pg_loss + cfg.kl_coef * kl - ent_coef * entropy) / max(1, grad_accum_steps)
                 if not torch.isfinite(loss):
@@ -149,7 +129,6 @@ class CISPO(RLAlgorithm):
                 total_kl += float(kl.detach().item())
                 total_entropy += float(entropy.detach().item())
                 total_clipfrac += float(clipfrac.detach().item())
-                total_dual_clipfrac += float(dual_clipfrac.detach().item())
                 n_mb += 1
 
         if accum > 0 and (accum % max(1, grad_accum_steps)) != 0:
@@ -167,8 +146,7 @@ class CISPO(RLAlgorithm):
             "train/policy_loss_with_kl_and_entropy_mean_over_minibatches": total_loss / denom,
             "train/approximate_kl_divergence_policy_vs_reference_mean_over_minibatches": total_kl / denom,
             "train/policy_token_entropy_mean_over_minibatches": total_entropy / denom,
-            "train/fraction_of_completion_tokens_where_ppo_ratio_was_clipped_mean_over_minibatches": total_clipfrac / denom,
-            "train/fraction_of_completion_tokens_where_dual_clip_was_active_mean_over_minibatches": total_dual_clipfrac / denom,
+            "train/fraction_of_completion_tokens_where_is_weight_was_clipped_mean_over_minibatches": total_clipfrac / denom,
             "train/count_minibatches_skipped_because_completion_mask_had_no_tokens": float(skipped_empty),
             "train/count_update_attempts_skipped_due_to_nonfinite_loss_or_gradients": float(skipped_nonfinite),
             "train/gradient_global_norm_after_clipping_mean_over_optimizer_steps": total_grad_norm / max(1, opt_steps),

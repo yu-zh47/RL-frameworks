@@ -108,6 +108,12 @@ def parse_args() -> TrainConfig:
     ap.add_argument("--vllm_device", type=str, default=TrainConfig.vllm_device)
     ap.add_argument("--vllm_enforce_eager", action=argparse.BooleanOptionalAction, default=TrainConfig.vllm_enforce_eager)
     ap.add_argument("--vllm_max_model_len", type=int, default=TrainConfig.vllm_max_model_len)
+    ap.add_argument(
+        "--sampler_lifecycle",
+        type=str,
+        default=TrainConfig.sampler_lifecycle,
+        choices=["persistent", "per_step"],
+    )
 
     # Training backend / finetune mode
     ap.add_argument("--training_backend", type=str, default=TrainConfig.training_backend,
@@ -202,6 +208,7 @@ def parse_args() -> TrainConfig:
         vllm_device=args.vllm_device,
         vllm_enforce_eager=args.vllm_enforce_eager,
         vllm_max_model_len=args.vllm_max_model_len,
+        sampler_lifecycle=args.sampler_lifecycle,
         training_backend=args.training_backend,
         finetune_mode=args.finetune_mode,
         fsdp_sharding_strategy=args.fsdp_sharding_strategy,
@@ -581,6 +588,13 @@ def main():
         raise ValueError(f"math_hard_eval_n must be >= 0, got {cfg.math_hard_eval_n}")
     if cfg.eval_batch_size <= 0:
         raise ValueError(f"eval_batch_size must be >= 1, got {cfg.eval_batch_size}")
+    if cfg.sampler != "vllm" and cfg.sampler_lifecycle != "persistent":
+        tqdm.write("[init] sampler_lifecycle is ignored for --sampler hf; using persistent mode.")
+        cfg.sampler_lifecycle = "persistent"
+    if cfg.sampler == "vllm" and cfg.sampler_lifecycle == "per_step" and cfg.training_backend == "fsdp":
+        raise ValueError(
+            "sampler_lifecycle=per_step is currently supported only with --training_backend hf."
+        )
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "checkpoints").mkdir(exist_ok=True)
@@ -648,6 +662,7 @@ def main():
     task = build_task(cfg)
 
     # ── Sampler ───────────────────────────────────────────────────────
+    vllm_cfg = None
     if cfg.sampler == "vllm":
         from llm_rl.rollout.vllm_sampler import VLLMSampler, VLLMSamplerConfig
         vllm_cfg = VLLMSamplerConfig(
@@ -657,18 +672,35 @@ def main():
             max_model_len=cfg.vllm_max_model_len if cfg.vllm_max_model_len > 0 else None,
             dtype="bfloat16" if dtype == torch.bfloat16 else "float16",
         )
-        sampler = VLLMSampler(
-            model_name=cfg.model_name,
-            tokenizer=tokenizer,
-            device=device,
-            vllm_cfg=vllm_cfg,
-            vllm_device=cfg.vllm_device or None,
-            ref_model=ref_model,
+
+    def build_sampler():
+        if cfg.sampler == "vllm":
+            # Keep import local so HF-only runs do not require vLLM deps.
+            from llm_rl.rollout.vllm_sampler import VLLMSampler
+
+            return VLLMSampler(
+                model_name=cfg.model_name,
+                tokenizer=tokenizer,
+                device=device,
+                vllm_cfg=vllm_cfg,
+                vllm_device=cfg.vllm_device or None,
+                ref_model=ref_model,
+            )
+        return HFSampler(tokenizer=tokenizer, device=device, ref_model=ref_model)
+
+    sampler = None
+    if cfg.sampler == "vllm":
+        tqdm.write(
+            f"[init] Using vLLM sampler (TP={cfg.vllm_tensor_parallel_size}, "
+            f"mem={cfg.vllm_gpu_memory_utilization}, device={cfg.vllm_device or 'auto'}, "
+            f"lifecycle={cfg.sampler_lifecycle})"
         )
-        tqdm.write(f"[init] Using vLLM sampler (TP={cfg.vllm_tensor_parallel_size}, "
-                    f"mem={cfg.vllm_gpu_memory_utilization}, device={cfg.vllm_device or 'auto'})")
+        if cfg.sampler_lifecycle == "persistent":
+            sampler = build_sampler()
+        else:
+            tqdm.write("[init] vLLM engine will be created and destroyed each rollout step.")
     else:
-        sampler = HFSampler(tokenizer=tokenizer, device=device, ref_model=ref_model)
+        sampler = build_sampler()
 
     tqdm.write(f"[init] backend={cfg.training_backend} finetune={cfg.finetune_mode} "
                f"trainable={loaded.trainable_params:,} / total={loaded.total_params:,}")
@@ -809,16 +841,22 @@ def main():
         task_names = [ex.task_name for ex in examples]
         task_metas = [ex.meta for ex in examples]
 
-        rollout_out = sampler.rollout(
-            policy_model=model,
-            prompt_messages=prompt_messages,
-            task_names=task_names,
-            task_metas=task_metas,
-            group_size=cfg.group_size,
-            sampling=sampling_cfg,
-            max_prompt_tokens=cfg.max_prompt_tokens,
-            output_to_cpu=cfg.rollout_on_cpu,
-        )
+        active_sampler = sampler if sampler is not None else build_sampler()
+        try:
+            rollout_out = active_sampler.rollout(
+                policy_model=model,
+                prompt_messages=prompt_messages,
+                task_names=task_names,
+                task_metas=task_metas,
+                group_size=cfg.group_size,
+                sampling=sampling_cfg,
+                max_prompt_tokens=cfg.max_prompt_tokens,
+                output_to_cpu=cfg.rollout_on_cpu,
+            )
+        finally:
+            if cfg.sampler == "vllm" and cfg.sampler_lifecycle == "per_step":
+                active_sampler.close()
+                del active_sampler
 
         rewards: List[float] = []
         reward_infos: List[Dict[str, Any]] = []
@@ -939,11 +977,18 @@ def main():
         if sample_rows and cfg.sample_log_interval > 0 and ((step + 1) % cfg.sample_log_interval == 0):
             if sample_rows:
                 logger.log_table(f"samples/{cfg.task}_prompt_completion_reward_breakdown", sample_rows, step=step)
+        loss_val = stats.get(
+            "train/policy_loss_with_kl_penalty_mean_over_minibatches",
+            stats.get(
+                "train/policy_loss_mean_over_minibatches",
+                stats.get("train/policy_loss_with_kl_and_entropy_mean_over_minibatches", 0.0)
+            )
+        )
         pbar.set_postfix(
             {
                 "reward": f"{stats['rollout/mean_total_reward_across_all_completions_in_batch_and_groups']:.6f}",
                 "kl": f"{stats.get('train/approximate_kl_divergence_policy_vs_reference_mean_over_minibatches', 0.0):.6f}",
-                "loss": f"{stats.get('train/policy_loss_with_kl_penalty_mean_over_minibatches', 0.0):.6f}",
+                "loss": f"{loss_val:.6f}",
             }
         )
 
@@ -962,6 +1007,8 @@ def main():
     final_eval_metrics = run_eval_for_task(eval_step=cfg.steps, phase="final_after_last_rl_update")
     logger.log(final_eval_metrics, step=cfg.steps)
     logger.finish()
+    if sampler is not None:
+        sampler.close()
     backend.cleanup()
 
 

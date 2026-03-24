@@ -29,3 +29,7 @@ class RolloutOutput:
 class Sampler:
     def rollout(self, *args, **kwargs) -> RolloutOutput:
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release engine resources (no-op for stateless samplers)."""
+        return None

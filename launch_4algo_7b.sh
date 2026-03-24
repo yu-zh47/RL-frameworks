@@ -3,10 +3,14 @@ set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────
 # Launch 4 parallel RL experiments on Qwen2.5-Math-7B-Instruct
-#   GRPO  on GPU 0 (train) + GPU 1 (vllm)
-#   DAPO  on GPU 2 (train) + GPU 3 (vllm)
-#   GSPO  on GPU 4 (train) + GPU 5 (vllm)
-#   CISPO on GPU 6 (train) + GPU 7 (vllm)
+#
+# Training GPUs: 0, 1, 2, 3  (one per algo)
+# vLLM GPUs:     4, 5, 6, 7  (one per algo, fully separated)
+#
+#   GRPO  → train cuda:0, vllm cuda:4
+#   DAPO  → train cuda:1, vllm cuda:5
+#   GSPO  → train cuda:2, vllm cuda:6
+#   CISPO → train cuda:3, vllm cuda:7
 # ──────────────────────────────────────────────────────────────────────
 
 MODEL="Qwen/Qwen2.5-Math-7B-Instruct"
@@ -20,8 +24,8 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 mkdir -p "$LOGDIR"
 
-# Use hf-mirror since direct HuggingFace access is blocked
 export HF_ENDPOINT="https://hf-mirror.com"
+export PYTHONUNBUFFERED=1
 
 COMMON_ARGS=(
     --model_name "$MODEL"
@@ -29,39 +33,33 @@ COMMON_ARGS=(
     --steps "$STEPS"
     --seed "$SEED"
 
-    # Rollout
     --sampler vllm
     --batch_size 8
     --group_size 6
-    --max_new_tokens 512
+    --max_new_tokens 1024
     --max_prompt_tokens 512
     --temperature 0.8
     --top_p 0.95
+    --minibatch_size 4
 
-    # LoRA on HF backend (single-GPU training)
     --training_backend hf
     --finetune_mode lora
-    --lora_r 16
-    --lora_alpha 32
+    --lora_r 64
+    --lora_alpha 128
 
-    # Optimization
     --lr 2e-5
     --warmup_steps 50
-    --grad_accum_steps 1
+    --grad_accum_steps 2
     --max_grad_norm 0.5
     --ppo_epochs 1
 
-    # vLLM config (gets a dedicated GPU)
-    --vllm_device cuda:1
-    --vllm_gpu_memory_utilization 0.85
+    --vllm_gpu_memory_utilization 0.90
     --vllm_tensor_parallel_size 1
 
-    # Memory
     --grad_checkpointing
-    --attn_implementation sdpa
+    --attn_implementation flash_attention_2
     --cuda_empty_cache_interval 20
 
-    # Eval & logging
     --eval_interval 100
     --save_interval 250
     --math_hard_eval_n 512
@@ -71,8 +69,9 @@ COMMON_ARGS=(
     --wandb_project "llm-rl-7b-algo-comparison"
 )
 
-ALGOS=("grpo" "dapo" "gspo" "cispo")
-GPU_PAIRS=("0,1" "2,3" "4,5" "6,7")
+ALGOS=(      "grpo"   "dapo"   "gspo"   "cispo" )
+TRAIN_GPUS=( "cuda:0" "cuda:1" "cuda:2" "cuda:3" )
+VLLM_GPUS=(  "cuda:4" "cuda:5" "cuda:6" "cuda:7" )
 PIDS=()
 
 echo "================================================================"
@@ -80,25 +79,29 @@ echo " Launching 4-algo comparison: ${ALGOS[*]}"
 echo " Model:  $MODEL"
 echo " Task:   $TASK (level 5)"
 echo " Steps:  $STEPS"
+echo " Config: batch=8 group=6 grad_accum=2 mb=4 max_tokens=1024 lora_r=64 FA2"
+echo " Train GPUs: ${TRAIN_GPUS[*]}"
+echo " vLLM GPUs:  ${VLLM_GPUS[*]}"
 echo " Time:   $TIMESTAMP"
 echo "================================================================"
 
 for i in "${!ALGOS[@]}"; do
     ALGO="${ALGOS[$i]}"
-    GPUS="${GPU_PAIRS[$i]}"
+    TDEV="${TRAIN_GPUS[$i]}"
+    VDEV="${VLLM_GPUS[$i]}"
     RUN_NAME="${ALGO}-7b-math-${TIMESTAMP}"
     OUT_DIR="runs/${ALGO}-7b-math-${TIMESTAMP}"
     LOGFILE="${LOGDIR}/${ALGO}-7b-${TIMESTAMP}.log"
 
     echo ""
-    echo "  [$ALGO] GPUs=$GPUS  output=$OUT_DIR  log=$LOGFILE"
+    echo "  [$ALGO] train=$TDEV  vllm=$VDEV  output=$OUT_DIR"
 
-    CUDA_VISIBLE_DEVICES="$GPUS" \
     conda run --no-capture-output -n "$CONDA_ENV" \
-        python -m llm_rl.train \
+        python -u -m llm_rl.train \
         "${COMMON_ARGS[@]}" \
         --algo "$ALGO" \
-        --train_device cuda:0 \
+        --train_device "$TDEV" \
+        --vllm_device "$VDEV" \
         --output_dir "$OUT_DIR" \
         --wandb_name "$RUN_NAME" \
         > "$LOGFILE" 2>&1 &
@@ -110,20 +113,17 @@ done
 echo ""
 echo "================================================================"
 echo " All 4 experiments launched. PIDs: ${PIDS[*]}"
-echo " Logs:   $LOGDIR/*-7b-${TIMESTAMP}.log"
-echo " Runs:   runs/*-7b-math-${TIMESTAMP}/"
-echo " WandB:  llm-rl-7b-algo-comparison"
-echo "================================================================"
 echo ""
-echo " Monitor with:"
+echo " Logs: $LOGDIR/*-7b-${TIMESTAMP}.log"
+echo " Runs: runs/*-7b-math-${TIMESTAMP}/"
+echo " WandB: llm-rl-7b-algo-comparison"
+echo ""
+echo " Monitor:"
 echo "   tail -f $LOGDIR/grpo-7b-${TIMESTAMP}.log"
 echo "   tail -f $LOGDIR/dapo-7b-${TIMESTAMP}.log"
 echo "   tail -f $LOGDIR/gspo-7b-${TIMESTAMP}.log"
 echo "   tail -f $LOGDIR/cispo-7b-${TIMESTAMP}.log"
-echo ""
-echo " Or watch all at once:"
-echo "   tail -f $LOGDIR/*-7b-${TIMESTAMP}.log"
-echo ""
+echo "================================================================"
 
 wait_and_report() {
     local failed=0
@@ -133,7 +133,7 @@ wait_and_report() {
         if wait "$pid"; then
             echo "[DONE]  $algo (PID $pid) finished successfully."
         else
-            echo "[FAIL]  $algo (PID $pid) exited with error. Check log: $LOGDIR/${algo}-7b-${TIMESTAMP}.log"
+            echo "[FAIL]  $algo (PID $pid) exited with error. Check: $LOGDIR/${algo}-7b-${TIMESTAMP}.log"
             failed=$((failed + 1))
         fi
     done

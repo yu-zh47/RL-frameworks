@@ -42,10 +42,8 @@ class TrainConfig:
 
     # DAPO: asymmetric upper clip (lower bound reuses clip_eps)
     clip_eps_high: float = 0.28
-    # CISPO: dual-clip coefficient for negative advantages
-    dual_clip_coef: float = 3.0
-    # CISPO: entropy bonus weight
-    entropy_coef: float = 0.001
+    dual_clip_coef: float = 3.0   # (unused after CISPO rewrite; kept for config compat)
+    entropy_coef: float = 0.001   # CISPO: entropy bonus weight
 
     # LoRA adapter config
     lora_r: int = 16
@@ -67,6 +65,7 @@ class TrainConfig:
     vllm_device: str = ""       # e.g. "cuda:1"; empty = same as training device
     vllm_enforce_eager: bool = False
     vllm_max_model_len: int = 0  # 0 = auto from model config
+    sampler_lifecycle: str = "persistent"  # persistent | per_step (vLLM only)
 
     # Training backend
     training_backend: str = "hf"  # hf | fsdp

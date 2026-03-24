@@ -76,6 +76,8 @@ The `vllm_device` config controls this.
 from __future__ import annotations
 
 import os
+import gc
+import shutil
 import tempfile
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -150,6 +152,33 @@ class VLLMSampler(Sampler):
             os.environ["CUDA_VISIBLE_DEVICES"] = old_visible
         else:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+
+    def close(self) -> None:
+        """Best-effort teardown of vLLM engine + temp adapter directory."""
+        llm = getattr(self, "llm", None)
+        if llm is not None:
+            # vLLM versions expose different teardown hooks; try all known ones.
+            try:
+                executor = getattr(getattr(llm, "llm_engine", None), "model_executor", None)
+                if executor is not None and hasattr(executor, "shutdown"):
+                    executor.shutdown()
+            except Exception:
+                pass
+            try:
+                if hasattr(llm, "shutdown"):
+                    llm.shutdown()
+            except Exception:
+                pass
+            self.llm = None
+
+        adapter_dir = getattr(self, "_adapter_dir", None)
+        if adapter_dir:
+            shutil.rmtree(adapter_dir, ignore_errors=True)
+            self._adapter_dir = ""
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # ── LoRA adapter sync ────────────────────────────────────────────────
 
